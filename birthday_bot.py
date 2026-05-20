@@ -8,30 +8,43 @@ from aiohttp import web
 from dotenv import load_dotenv
 import google.generativeai as genai
 
-load_dotenv()  # loads variables from .env into os.environ
+load_dotenv()
 
 # ─────────────────────────────────────────────
-#  CONFIGURATION — loaded from .env file
+#  CONFIGURATION
 # ─────────────────────────────────────────────
 BOT_TOKEN        = os.getenv("BOT_TOKEN")
-BIRTHDAY_USER_ID = int(os.getenv("BIRTHDAY_USER_ID"))
-CHANNEL_ID       = int(os.getenv("CHANNEL_ID"))
-PING_INTERVAL    = int(os.getenv("PING_INTERVAL", 15))
-GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY")  # optional — enables AI messages
+BIRTHDAY_USER_ID = int(os.getenv("BIRTHDAY_USER_ID", "0"))
+CHANNEL_ID       = int(os.getenv("CHANNEL_ID", "0"))
+PING_INTERVAL    = int(os.getenv("PING_INTERVAL", "15"))
+GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY")
 
-# Validate required vars
 missing = [k for k, v in {
     "BOT_TOKEN": BOT_TOKEN,
-    "BIRTHDAY_USER_ID": BIRTHDAY_USER_ID,
-    "CHANNEL_ID": CHANNEL_ID,
+    "BIRTHDAY_USER_ID": os.getenv("BIRTHDAY_USER_ID"),
+    "CHANNEL_ID": os.getenv("CHANNEL_ID"),
 }.items() if not v]
 
 if missing:
     raise EnvironmentError(f"❌ Missing required .env variables: {', '.join(missing)}")
 
 # ─────────────────────────────────────────────
-#  Fallback messages (used if Gemini API
-#  is unavailable or the key isn't set)
+#  GEMINI SETUP
+# ─────────────────────────────────────────────
+gemini_model = None
+
+if GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+        print("🤖 Gemini API ready.")
+    except Exception as e:
+        print(f"⚠️  Gemini setup failed: {e} — using fallback messages.")
+else:
+    print("⚠️  GEMINI_API_KEY not set — using fallback messages.")
+
+# ─────────────────────────────────────────────
+#  FALLBACK MESSAGES
 # ─────────────────────────────────────────────
 FALLBACK_MESSAGES = [
     "🎂 HAPPY BIRTHDAY <@{uid}>! Hope your day is absolutely amazing! 🎉",
@@ -40,17 +53,6 @@ FALLBACK_MESSAGES = [
     "🎈 Happy Birthday <@{uid}>!! You deserve all the cake in the world! 🎂",
     "🥂 Cheers to you, <@{uid}>! HAPPY BIRTHDAY!! 🎉🎊🎈",
 ]
-
-# ─────────────────────────────────────────────
-#  Gemini client setup
-# ─────────────────────────────────────────────
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel("gemini-2.0-flash")
-    print("🤖 Gemini API configured — AI messages enabled.")
-else:
-    gemini_model = None
-    print("⚠️  GEMINI_API_KEY not set — falling back to hardcoded messages.")
 
 STYLES = [
     "overly dramatic and theatrical",
@@ -65,30 +67,37 @@ STYLES = [
     "like a disappointed parent who is also very proud",
 ]
 
-ping_count = 0  # tracks total pings sent
+ping_count = 0
 
 
-async def fetch_ai_birthday_message() -> str | None:
-    """Ask Gemini for a unique birthday message. Returns None on failure."""
+async def fetch_gemini_message() -> str | None:
+    """
+    Calls Gemini synchronously inside a thread so it doesn't block the
+    event loop. Returns the message string, or None on any failure.
+    """
     style = random.choice(STYLES)
     prompt = (
-        f"Write a single short birthday message ({style}). "
-        "Include at least one relevant emoji. "
-        "Do NOT include a username or any placeholder — "
-        "the message will be prefixed with a Discord mention automatically. "
-        "Reply with only the message text, nothing else."
+        f"Write one short, fun birthday message in this style: {style}. "
+        "Include 1-2 relevant emojis. "
+        "Do NOT include a name or username — the Discord mention is added automatically. "
+        "Reply with only the message text and nothing else."
     )
     try:
-        # GenerativeModel.generate_content_async is the async entrypoint
-        response = await gemini_model.generate_content_async(prompt)
-        return response.text.strip()
+        # Run the blocking SDK call in a thread to avoid blocking the event loop
+        response = await asyncio.to_thread(gemini_model.generate_content, prompt)
+        text = response.text.strip()
+        if not text:
+            print("⚠️  Gemini returned empty response — using fallback.")
+            return None
+        print(f"✅ Gemini message: {text[:60]}...")
+        return text
     except Exception as e:
-        print(f"⚠️  Gemini API error: {e}")
+        print(f"⚠️  Gemini API error ({type(e).__name__}): {e} — using fallback.")
         return None
 
 
 # ─────────────────────────────────────────────
-#  Bot setup
+#  BOT SETUP
 # ─────────────────────────────────────────────
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -97,9 +106,12 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
-    mode = "Gemini AI" if gemini_model else "hardcoded fallback"
-    print(f"🎂 Birthday pings every {PING_INTERVAL}s using {mode} messages")
-    birthday_ping.start()
+    # Guard against on_ready firing multiple times on reconnects
+    if not birthday_ping.is_running():
+        birthday_ping.start()
+        print(f"🎂 Birthday ping loop started — every {PING_INTERVAL}s")
+    else:
+        print("🔁 Reconnected — ping loop already running, skipping restart.")
 
 
 @tasks.loop(seconds=PING_INTERVAL)
@@ -108,23 +120,23 @@ async def birthday_ping():
 
     channel = bot.get_channel(CHANNEL_ID)
     if channel is None:
-        print(f"❌ Could not find channel {CHANNEL_ID}. Check the ID.")
+        print(f"❌ Channel {CHANNEL_ID} not found.")
         return
 
-    # Try Gemini first; fall back to hardcoded list
+    # Try Gemini; fall back to cycling through the hardcoded list
     if gemini_model:
-        body = await fetch_ai_birthday_message()
+        body = await fetch_gemini_message()
     else:
         body = None
 
-    if body is None:
-        msg = random.choice(FALLBACK_MESSAGES).format(uid=BIRTHDAY_USER_ID)
-    else:
+    if body:
         msg = f"<@{BIRTHDAY_USER_ID}> {body}"
+    else:
+        msg = FALLBACK_MESSAGES[ping_count % len(FALLBACK_MESSAGES)].format(uid=BIRTHDAY_USER_ID)
 
     await channel.send(msg)
     ping_count += 1
-    print(f"🎉 Sent birthday ping #{ping_count}")
+    print(f"🎉 Ping #{ping_count} sent.")
 
 
 @birthday_ping.before_loop
@@ -132,8 +144,15 @@ async def before_birthday_ping():
     await bot.wait_until_ready()
 
 
+@birthday_ping.error
+async def birthday_ping_error(error):
+    # Catch any unhandled exception in the loop so it doesn't silently die
+    print(f"❌ birthday_ping task error: {error}")
+    birthday_ping.restart()
+
+
 # ─────────────────────────────────────────────
-#  Optional commands
+#  COMMANDS
 # ─────────────────────────────────────────────
 
 @bot.command(name="stopbirthday")
@@ -160,12 +179,14 @@ async def start_birthday(ctx):
 async def birthday_status(ctx):
     mode = "Gemini AI 🤖" if gemini_model else "hardcoded fallback 📋"
     status = "✅ Running" if birthday_ping.is_running() else "🛑 Stopped"
-    await ctx.send(f"Birthday ping loop: {status} | Messages: {mode} | Pings sent: {ping_count}")
+    await ctx.send(
+        f"Loop: {status} | Messages: {mode} | Pings sent: {ping_count}"
+    )
 
 
 # ─────────────────────────────────────────────
-#  Keepalive web server (for Render deployments)
-#  NOTE: CSS braces must be doubled ({{ }}) to escape Python's str.format()
+#  KEEPALIVE WEB SERVER
+#  CSS braces doubled ({{ }}) to escape str.format()
 # ─────────────────────────────────────────────
 START_TIME = datetime.datetime.now(datetime.UTC)
 
@@ -253,7 +274,7 @@ async def handle_root(request):
     hours, remainder = divmod(int(delta.total_seconds()), 3600)
     minutes, seconds = divmod(remainder, 60)
     uptime = f"{hours}h {minutes}m {seconds}s"
-    mode = "🤖 Gemini AI messages" if gemini_model else "📋 Fallback messages"
+    mode = "🤖 Gemini AI" if gemini_model else "📋 Fallback messages"
     html = KEEPALIVE_HTML.format(
         interval=PING_INTERVAL,
         uptime=uptime,
@@ -276,7 +297,7 @@ async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle_root)
     app.router.add_get("/health", handle_health)
-    port = int(os.getenv("PORT", 8080))
+    port = int(os.getenv("PORT", "8080"))
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
@@ -285,7 +306,7 @@ async def start_web_server():
 
 
 # ─────────────────────────────────────────────
-#  Run both the web server and bot concurrently
+#  ENTRY POINT
 # ─────────────────────────────────────────────
 async def main():
     await start_web_server()
