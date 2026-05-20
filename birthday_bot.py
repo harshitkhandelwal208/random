@@ -6,7 +6,7 @@ import datetime
 import random
 from aiohttp import web
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
 
 load_dotenv()
 
@@ -29,15 +29,14 @@ if missing:
     raise EnvironmentError(f"❌ Missing required .env variables: {', '.join(missing)}")
 
 # ─────────────────────────────────────────────
-#  GEMINI SETUP
+#  GEMINI SETUP  (google-genai, not google-generativeai)
 # ─────────────────────────────────────────────
-gemini_model = None
+gemini_client = None
 
 if GEMINI_API_KEY:
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        gemini_model = genai.GenerativeModel("gemini-2.0-flash")
-        print("🤖 Gemini API ready.")
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        print("🤖 Gemini API ready (google-genai SDK).")
     except Exception as e:
         print(f"⚠️  Gemini setup failed: {e} — using fallback messages.")
 else:
@@ -72,8 +71,8 @@ ping_count = 0
 
 async def fetch_gemini_message() -> str | None:
     """
-    Calls Gemini synchronously inside a thread so it doesn't block the
-    event loop. Returns the message string, or None on any failure.
+    Uses the new google-genai SDK's native async path (client.aio).
+    Returns the message string, or None on any failure.
     """
     style = random.choice(STYLES)
     prompt = (
@@ -83,13 +82,15 @@ async def fetch_gemini_message() -> str | None:
         "Reply with only the message text and nothing else."
     )
     try:
-        # Run the blocking SDK call in a thread to avoid blocking the event loop
-        response = await asyncio.to_thread(gemini_model.generate_content, prompt)
+        response = await gemini_client.aio.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+        )
         text = response.text.strip()
         if not text:
             print("⚠️  Gemini returned empty response — using fallback.")
             return None
-        print(f"✅ Gemini message: {text[:60]}...")
+        print(f"✅ Gemini message: {text[:80]}")
         return text
     except Exception as e:
         print(f"⚠️  Gemini API error ({type(e).__name__}): {e} — using fallback.")
@@ -123,8 +124,7 @@ async def birthday_ping():
         print(f"❌ Channel {CHANNEL_ID} not found.")
         return
 
-    # Try Gemini; fall back to cycling through the hardcoded list
-    if gemini_model:
+    if gemini_client:
         body = await fetch_gemini_message()
     else:
         body = None
@@ -146,7 +146,6 @@ async def before_birthday_ping():
 
 @birthday_ping.error
 async def birthday_ping_error(error):
-    # Catch any unhandled exception in the loop so it doesn't silently die
     print(f"❌ birthday_ping task error: {error}")
     birthday_ping.restart()
 
@@ -177,11 +176,9 @@ async def start_birthday(ctx):
 
 @bot.command(name="birthdaystatus")
 async def birthday_status(ctx):
-    mode = "Gemini AI 🤖" if gemini_model else "hardcoded fallback 📋"
+    mode = "Gemini AI 🤖" if gemini_client else "hardcoded fallback 📋"
     status = "✅ Running" if birthday_ping.is_running() else "🛑 Stopped"
-    await ctx.send(
-        f"Loop: {status} | Messages: {mode} | Pings sent: {ping_count}"
-    )
+    await ctx.send(f"Loop: {status} | Messages: {mode} | Pings sent: {ping_count}")
 
 
 # ─────────────────────────────────────────────
@@ -274,7 +271,7 @@ async def handle_root(request):
     hours, remainder = divmod(int(delta.total_seconds()), 3600)
     minutes, seconds = divmod(remainder, 60)
     uptime = f"{hours}h {minutes}m {seconds}s"
-    mode = "🤖 Gemini AI" if gemini_model else "📋 Fallback messages"
+    mode = "🤖 Gemini AI" if gemini_client else "📋 Fallback messages"
     html = KEEPALIVE_HTML.format(
         interval=PING_INTERVAL,
         uptime=uptime,
@@ -289,7 +286,7 @@ async def handle_health(request):
         "status": "ok",
         "uptime_seconds": int((datetime.datetime.now(datetime.UTC) - START_TIME).total_seconds()),
         "pings_sent": ping_count,
-        "message_mode": "gemini" if gemini_model else "fallback",
+        "message_mode": "gemini" if gemini_client else "fallback",
     })
 
 
