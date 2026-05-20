@@ -1,50 +1,69 @@
-import discord
-from discord.ext import commands, tasks
-import os
 import asyncio
-import datetime
+import datetime as dt
+import logging
+import os
 import random
+from typing import Optional
+
+import discord
 from aiohttp import web
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from google import genai
 
 load_dotenv()
 
-# ─────────────────────────────────────────────
-#  CONFIGURATION
-# ─────────────────────────────────────────────
-BOT_TOKEN        = os.getenv("BOT_TOKEN")
+# ============================================================
+# CONFIG
+# ============================================================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
 BIRTHDAY_USER_ID = int(os.getenv("BIRTHDAY_USER_ID", "0"))
-CHANNEL_ID       = int(os.getenv("CHANNEL_ID", "0"))
-PING_INTERVAL    = int(os.getenv("PING_INTERVAL", "15"))
-GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 
-missing = [k for k, v in {
+PING_INTERVAL = max(1, int(os.getenv("PING_INTERVAL", "15")))
+PORT = int(os.getenv("PORT", "8080"))
+
+# Let env override the model, but keep a safe fallback list.
+RAW_MODEL = os.getenv("GEMINI_MODEL", "").strip()
+GEMINI_MODELS = [m for m in [RAW_MODEL, "gemini-3.5-flash", "gemini-2.0-flash"] if m]
+
+REQUIRED_ENV = {
     "BOT_TOKEN": BOT_TOKEN,
-    "BIRTHDAY_USER_ID": os.getenv("BIRTHDAY_USER_ID"),
-    "CHANNEL_ID": os.getenv("CHANNEL_ID"),
-}.items() if not v]
+    "BIRTHDAY_USER_ID": str(BIRTHDAY_USER_ID) if BIRTHDAY_USER_ID else "",
+    "CHANNEL_ID": str(CHANNEL_ID) if CHANNEL_ID else "",
+}
 
+missing = [name for name, value in REQUIRED_ENV.items() if not value]
 if missing:
-    raise EnvironmentError(f"❌ Missing required .env variables: {', '.join(missing)}")
+    raise EnvironmentError(
+        f"Missing required .env variables: {', '.join(missing)}"
+    )
 
-# ─────────────────────────────────────────────
-#  GEMINI SETUP  (google-genai, not google-generativeai)
-# ─────────────────────────────────────────────
-gemini_client = None
+# ============================================================
+# LOGGING
+# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("birthday-bot")
 
+# ============================================================
+# GEMINI SETUP
+# ============================================================
+gemini_client: Optional[genai.Client] = None
 if GEMINI_API_KEY:
     try:
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-        print("🤖 Gemini API ready (google-genai SDK).")
-    except Exception as e:
-        print(f"⚠️  Gemini setup failed: {e} — using fallback messages.")
+        log.info("Gemini client initialized.")
+    except Exception as exc:
+        log.warning("Gemini init failed: %s", exc)
+        gemini_client = None
 else:
-    print("⚠️  GEMINI_API_KEY not set — using fallback messages.")
+    log.info("No GEMINI_API_KEY found; bot will use fallback messages.")
 
-# ─────────────────────────────────────────────
-#  FALLBACK MESSAGES
-# ─────────────────────────────────────────────
 FALLBACK_MESSAGES = [
     "🎂 HAPPY BIRTHDAY <@{uid}>! Hope your day is absolutely amazing! 🎉",
     "🎁 Hey <@{uid}>, HAPPY BIRTHDAY!! Wishing you all the best today! 🥳",
@@ -67,76 +86,122 @@ STYLES = [
 ]
 
 ping_count = 0
+START_TIME = dt.datetime.now(dt.timezone.utc)
+
+# ============================================================
+# DISCORD BOT
+# ============================================================
+intents = discord.Intents.default()
+intents.message_content = True  # also enable in Discord Developer Portal
+
+bot = commands.Bot(command_prefix=commands.when_mentioned_or("!"), intents=intents)
 
 
-async def fetch_gemini_message() -> str | None:
+def clean_gemini_text(text: str) -> str:
     """
-    Uses the new google-genai SDK's native async path (client.aio).
-    Returns the message string, or None on any failure.
+    Make Gemini output safe and compact for a Discord message.
     """
+    text = text.strip()
+    text = text.replace("\n", " ").replace("\r", " ")
+
+    # Remove common markdown wrappers if the model adds them.
+    if text.startswith("```") and text.endswith("```"):
+        text = text.strip("`").strip()
+
+    # Keep it short and to the point.
+    if len(text) > 300:
+        text = text[:300].rstrip() + "…"
+
+    return text
+
+
+async def fetch_gemini_message() -> Optional[str]:
+    """
+    Generate one short birthday message using Gemini.
+    Returns None if anything goes wrong.
+    """
+    if gemini_client is None:
+        return None
+
     style = random.choice(STYLES)
     prompt = (
         f"Write one short, fun birthday message in this style: {style}. "
-        "Include 1-2 relevant emojis. "
-        "Do NOT include a name or username — the Discord mention is added automatically. "
-        "Reply with only the message text and nothing else."
+        "Use 1-2 relevant emojis. "
+        "Do NOT include a name or username. "
+        "Do NOT wrap the response in quotes or markdown. "
+        "Reply with only the final message text."
     )
+
+    last_error: Optional[Exception] = None
+
+    for model_name in GEMINI_MODELS:
+        try:
+            response = await gemini_client.aio.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+
+            text = getattr(response, "text", None)
+            if not text:
+                log.warning("Gemini returned empty text for model %s", model_name)
+                continue
+
+            cleaned = clean_gemini_text(text)
+            if cleaned:
+                log.info("Gemini message generated with %s", model_name)
+                return cleaned
+
+        except Exception as exc:
+            last_error = exc
+            log.warning("Gemini error with %s: %s", model_name, exc)
+
+    if last_error:
+        log.warning("All Gemini attempts failed; using fallback.")
+    return None
+
+
+async def get_channel(channel_id: int) -> Optional[discord.abc.Messageable]:
+    """
+    Fetch the channel safely, even if it isn't cached.
+    """
+    channel = bot.get_channel(channel_id)
+    if channel is not None:
+        return channel
+
     try:
-        response = await gemini_client.aio.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt,
-        )
-        text = response.text.strip()
-        if not text:
-            print("⚠️  Gemini returned empty response — using fallback.")
-            return None
-        print(f"✅ Gemini message: {text[:80]}")
-        return text
-    except Exception as e:
-        print(f"⚠️  Gemini API error ({type(e).__name__}): {e} — using fallback.")
+        fetched = await bot.fetch_channel(channel_id)
+        return fetched
+    except Exception as exc:
+        log.error("Could not fetch channel %s: %s", channel_id, exc)
         return None
-
-
-# ─────────────────────────────────────────────
-#  BOT SETUP
-# ─────────────────────────────────────────────
-intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-
-@bot.event
-async def on_ready():
-    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
-    # Guard against on_ready firing multiple times on reconnects
-    if not birthday_ping.is_running():
-        birthday_ping.start()
-        print(f"🎂 Birthday ping loop started — every {PING_INTERVAL}s")
-    else:
-        print("🔁 Reconnected — ping loop already running, skipping restart.")
 
 
 @tasks.loop(seconds=PING_INTERVAL)
 async def birthday_ping():
     global ping_count
 
-    channel = bot.get_channel(CHANNEL_ID)
-    if channel is None:
-        print(f"❌ Channel {CHANNEL_ID} not found.")
-        return
+    try:
+        channel = await get_channel(CHANNEL_ID)
+        if channel is None:
+            log.error("Channel %s not found.", CHANNEL_ID)
+            return
 
-    if gemini_client:
         body = await fetch_gemini_message()
-    else:
-        body = None
+        if body:
+            msg = f"<@{BIRTHDAY_USER_ID}> {body}"
+        else:
+            msg = random.choice(FALLBACK_MESSAGES).format(uid=BIRTHDAY_USER_ID)
 
-    if body:
-        msg = f"<@{BIRTHDAY_USER_ID}> {body}"
-    else:
-        msg = FALLBACK_MESSAGES[ping_count % len(FALLBACK_MESSAGES)].format(uid=BIRTHDAY_USER_ID)
+        await channel.send(msg)
+        ping_count += 1
+        log.info("Birthday ping #%d sent.", ping_count)
 
-    await channel.send(msg)
-    ping_count += 1
-    print(f"🎉 Ping #{ping_count} sent.")
+    except discord.Forbidden:
+        log.error("Missing permission to send messages in channel %s.", CHANNEL_ID)
+    except discord.HTTPException as exc:
+        log.error("Discord HTTP error while sending message: %s", exc)
+    except Exception as exc:
+        log.exception("Unexpected error in birthday_ping: %s", exc)
 
 
 @birthday_ping.before_loop
@@ -144,19 +209,23 @@ async def before_birthday_ping():
     await bot.wait_until_ready()
 
 
-@birthday_ping.error
-async def birthday_ping_error(error):
-    print(f"❌ birthday_ping task error: {error}")
-    birthday_ping.restart()
+@bot.event
+async def on_ready():
+    log.info("Logged in as %s (ID: %s)", bot.user, bot.user.id if bot.user else "unknown")
+
+    if not birthday_ping.is_running():
+        birthday_ping.start()
+        log.info("Birthday ping loop started; interval=%ss", PING_INTERVAL)
+    else:
+        log.info("Birthday ping loop already running.")
 
 
-# ─────────────────────────────────────────────
-#  COMMANDS
-# ─────────────────────────────────────────────
-
+# ============================================================
+# COMMANDS
+# ============================================================
 @bot.command(name="stopbirthday")
 @commands.has_permissions(administrator=True)
-async def stop_birthday(ctx):
+async def stop_birthday(ctx: commands.Context):
     if birthday_ping.is_running():
         birthday_ping.stop()
         await ctx.send("🛑 Birthday pings stopped.")
@@ -166,7 +235,7 @@ async def stop_birthday(ctx):
 
 @bot.command(name="startbirthday")
 @commands.has_permissions(administrator=True)
-async def start_birthday(ctx):
+async def start_birthday(ctx: commands.Context):
     if not birthday_ping.is_running():
         birthday_ping.start()
         await ctx.send("🎉 Birthday pings started!")
@@ -175,18 +244,26 @@ async def start_birthday(ctx):
 
 
 @bot.command(name="birthdaystatus")
-async def birthday_status(ctx):
-    mode = "Gemini AI 🤖" if gemini_client else "hardcoded fallback 📋"
+async def birthday_status(ctx: commands.Context):
+    mode = "Gemini AI 🤖" if gemini_client else "fallback messages 📋"
     status = "✅ Running" if birthday_ping.is_running() else "🛑 Stopped"
-    await ctx.send(f"Loop: {status} | Messages: {mode} | Pings sent: {ping_count}")
+    await ctx.send(
+        f"Loop: {status} | Messages: {mode} | Pings sent: {ping_count}"
+    )
 
 
-# ─────────────────────────────────────────────
-#  KEEPALIVE WEB SERVER
-#  CSS braces doubled ({{ }}) to escape str.format()
-# ─────────────────────────────────────────────
-START_TIME = datetime.datetime.now(datetime.UTC)
+@stop_birthday.error
+@start_birthday.error
+async def admin_only_error(ctx: commands.Context, error: Exception):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("⛔ You need administrator permissions for that.")
+    else:
+        raise error
 
+
+# ============================================================
+# KEEPALIVE WEB SERVER
+# ============================================================
 KEEPALIVE_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -265,13 +342,16 @@ KEEPALIVE_HTML = """<!DOCTYPE html>
 </html>"""
 
 
-async def handle_root(request):
-    now = datetime.datetime.now(datetime.UTC)
+async def handle_root(request: web.Request) -> web.Response:
+    now = dt.datetime.now(dt.timezone.utc)
     delta = now - START_TIME
-    hours, remainder = divmod(int(delta.total_seconds()), 3600)
+    total_seconds = int(delta.total_seconds())
+
+    hours, remainder = divmod(total_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     uptime = f"{hours}h {minutes}m {seconds}s"
     mode = "🤖 Gemini AI" if gemini_client else "📋 Fallback messages"
+
     html = KEEPALIVE_HTML.format(
         interval=PING_INTERVAL,
         uptime=uptime,
@@ -281,33 +361,45 @@ async def handle_root(request):
     return web.Response(text=html, content_type="text/html")
 
 
-async def handle_health(request):
-    return web.json_response({
-        "status": "ok",
-        "uptime_seconds": int((datetime.datetime.now(datetime.UTC) - START_TIME).total_seconds()),
-        "pings_sent": ping_count,
-        "message_mode": "gemini" if gemini_client else "fallback",
-    })
+async def handle_health(request: web.Request) -> web.Response:
+    return web.json_response(
+        {
+            "status": "ok",
+            "uptime_seconds": int(
+                (dt.datetime.now(dt.timezone.utc) - START_TIME).total_seconds()
+            ),
+            "pings_sent": ping_count,
+            "message_mode": "gemini" if gemini_client else "fallback",
+        }
+    )
 
 
-async def start_web_server():
+async def start_web_server() -> web.AppRunner:
     app = web.Application()
     app.router.add_get("/", handle_root)
     app.router.add_get("/health", handle_health)
-    port = int(os.getenv("PORT", "8080"))
+
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(f"🌐 Keepalive server running on port {port}")
+
+    log.info("Keepalive server running on port %s", PORT)
+    return runner
 
 
-# ─────────────────────────────────────────────
-#  ENTRY POINT
-# ─────────────────────────────────────────────
+# ============================================================
+# MAIN
+# ============================================================
 async def main():
-    await start_web_server()
-    await bot.start(BOT_TOKEN)
+    runner = None
+    try:
+        runner = await start_web_server()
+        await bot.start(BOT_TOKEN)
+    finally:
+        if runner is not None:
+            await runner.cleanup()
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
